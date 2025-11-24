@@ -1,11 +1,10 @@
-# app.py
-
 from flask import Flask, request, jsonify
 import os
 import json
+import subprocess
+import speech_recognition as sr
 import easyocr
 from google.genai import Client
-from google.genai.errors import APIError
 
 app = Flask(__name__)
 
@@ -20,26 +19,50 @@ client = Client(api_key=API_KEY)
 # ==========================================
 reader = easyocr.Reader(['en'])
 
+# ==========================================
+# AUDIO TRANSCRIPTION (Auto-convert any file to WAV)
+# ==========================================
+def transcribe_audio(file_path):
+    wav_path = file_path + ".wav"
+
+    # Convert ANY audio format → WAV (16kHz mono)
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", file_path, "-ac", "1", "-ar", "16000", wav_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        print("FFmpeg conversion failed:", e)
+        return ""
+
+    recognizer = sr.Recognizer()
+
+    try:
+        with sr.AudioFile(wav_path) as source:
+            audio = recognizer.record(source)
+            text = recognizer.recognize_google(audio)
+            return text
+    except Exception as e:
+        print("Transcription error:", e)
+        return ""
 
 # ==========================================
-# PROCESS RECEIPTS (OCR TEXT)
+# GEMINI RECEIPT CLEANER
 # ==========================================
 def clean_receipt_with_gemini(raw_text):
     prompt = f"""
 You are an assistant that extracts structured receipt data.
 
 RULES:
-- Sometimes a number appears BEFORE an item. This is quantity.
-    Example: "2 BANANA" → item: "BANANA", quantity: 2
-- If no quantity appears, assume quantity = 1.
-- Extract ONLY item names, quantities, and unit prices.
-- Ignore EVERYTHING else: TOTAL, CASH, CHANGE, store name, footer text, warnings.
-- Keep item names clean and readable.
-- Keep all prices exactly as seen.
+- Numbers before an item = quantity.
+- If no quantity → quantity = 1.
+- Extract item name, quantity, unit (if any), and price.
+- Ignore totals, cash, VAT, store name, etc.
 
 OUTPUT STRICT JSON:
 [
-  {{"item": "ITEM_NAME", "quantity": NUMBER, "price": NUMBER}},
+  {{"item": "ITEM", "quantity": NUMBER, "unit": "UNIT" or null, "price": NUMBER}},
   ...
 ]
 
@@ -55,7 +78,6 @@ Receipt text:
 
         text_output = response.text.strip()
 
-        # Strip ```json wrappers
         if text_output.startswith("```"):
             lines = text_output.split("\n")
             text_output = "\n".join(lines[1:-1]).strip()
@@ -63,31 +85,26 @@ Receipt text:
         return json.loads(text_output)
 
     except Exception as e:
-        print("Gemini processing error:", e)
+        print("Gemini error:", e)
         return []
 
-
 # ==========================================
-# PROCESS VOICE TEXT (SECOND AGENT)
+# GEMINI VOICE PARSER
 # ==========================================
 def parse_voice_text_with_gemini(text):
     prompt = f"""
-You are an assistant that extracts structured shopping data from natural language text.
+You extract purchased items from natural language voice text.
 
 RULES:
-- Text comes from voice transcription like:
-  "Today I bought two bananas and a watermelon for 4 dollars"
-- Extract ONLY purchased items, quantities, and prices.
-- If quantity is mentioned → use it.
-- If no quantity is mentioned → quantity = 1.
-- If price is mentioned → use it.
-- If no price mentioned → "price": null.
-- Ignore everything that is not a purchased item.
-- Ignore "today I bought", greetings, story parts, etc.
+- Example input: "I bought two bananas and a watermelon for 4 dollars"
+- Extract ONLY items, quantities, unit, price.
+- If quantity missing → quantity = 1
+- If price missing → price = null
+- If unit missing → unit = null
 
 OUTPUT STRICT JSON:
 [
-  {{"item": "ITEM_NAME", "quantity": NUMBER, "price": NUMBER or null}},
+  {{"item": "ITEM", "quantity": NUMBER, "unit": "UNIT" or null, "price": NUMBER or null}},
   ...
 ]
 
@@ -103,7 +120,6 @@ User text:
 
         output = response.text.strip()
 
-        # Strip ```json wrappers
         if output.startswith("```"):
             lines = output.split("\n")
             output = "\n".join(lines[1:-1]).strip()
@@ -111,12 +127,11 @@ User text:
         return json.loads(output)
 
     except Exception as e:
-        print("Error:", e)
+        print("Gemini voice error:", e)
         return []
 
-
 # ==========================================
-# OCR RECEIPT ENDPOINT
+# OCR ENDPOINT
 # ==========================================
 @app.route("/parse_receipt", methods=["POST"])
 def parse_receipt():
@@ -127,21 +142,19 @@ def parse_receipt():
     if file.filename == "":
         return jsonify({"error": "Empty filename"}), 400
 
-    # Save file locally
     os.makedirs("ocr_images", exist_ok=True)
     image_path = os.path.join("ocr_images", file.filename)
     file.save(image_path)
 
-    # OCR extraction
     ocr_results = reader.readtext(image_path)
     raw_text = "\n".join([t for (_, t, _) in ocr_results])
 
-    # Clean with Gemini
     items = clean_receipt_with_gemini(raw_text)
 
-    total = 0
-    for item in items:
-        total += float(item["price"]) * int(item["quantity"])
+    total = sum(
+        float(item["price"]) * int(item["quantity"])
+        for item in items if item["price"] is not None
+    )
 
     return jsonify({
         "image": image_path,
@@ -150,42 +163,49 @@ def parse_receipt():
         "total": round(total, 2)
     })
 
-
 # ==========================================
-# VOICE TEXT ENDPOINT (SECOND AGENT)
+# VOICE ENDPOINT (audio file → text → Gemini)
 # ==========================================
 @app.route("/parse_voice", methods=["POST"])
 def parse_voice():
-    data = request.get_json()
-    if not data or "text" not in data:
-        return jsonify({"error": "Missing 'text' field"}), 400
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
 
-    user_text = data["text"]
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "Empty filename"}), 400
 
-    items = parse_voice_text_with_gemini(user_text)
+    os.makedirs("voice_uploads", exist_ok=True)
+    audio_path = os.path.join("voice_uploads", file.filename)
+    file.save(audio_path)
 
-    total = 0
-    for item in items:
-        if item["price"] is not None:
-            total += item["price"] * item["quantity"]
+    # Convert + transcribe
+    text = transcribe_audio(audio_path)
+    if not text:
+        return jsonify({"error": "Couldn't transcribe audio"}), 400
+
+    items = parse_voice_text_with_gemini(text)
+
+    total = sum(
+        (item["price"] or 0) * item["quantity"]
+        for item in items
+    )
 
     return jsonify({
-        "raw_text": user_text,
+        "raw_text": text,
         "items": items,
         "estimated_total": round(total, 2)
     })
-
 
 # ==========================================
 # ROOT
 # ==========================================
 @app.route("/")
 def index():
-    return "Finovia OCR API is running. POST to /parse_receipt or /parse_voice"
-
+    return "Finovia OCR & Voice API is running."
 
 # ==========================================
-# AUTO SWITCH PORT IF 5000 IS BUSY
+# PORT HANDLER
 # ==========================================
 def run_server():
     import socket
@@ -196,9 +216,8 @@ def run_server():
                 break
             port += 1
 
-    print(f"Starting server on port {port}...")
+    print(f"Server running on port {port}")
     app.run(host="0.0.0.0", port=port, debug=True)
-
 
 if __name__ == "__main__":
     run_server()
